@@ -107,6 +107,8 @@ class ClaudeQuotaApplet extends Applet.TextIconApplet {
         this._lastError = null;
         this._lastFetchAt = 0;     // ms epoch of last successful fetch
         this._inFlight = false;    // network call currently running
+        this._cooldownUntil = 0;   // ms epoch; refuse to fetch before this
+        this._cooldownTickTimeout = 0;
 
         this.set_applet_icon_path(ICON_OK);
         this.set_applet_label(" …");
@@ -146,10 +148,19 @@ class ClaudeQuotaApplet extends Applet.TextIconApplet {
             Mainloop.source_remove(this._refreshTimeout);
             this._refreshTimeout = 0;
         }
+        if (this._cooldownTickTimeout > 0) {
+            Mainloop.source_remove(this._cooldownTickTimeout);
+            this._cooldownTickTimeout = 0;
+        }
         try { this.settings.finalize(); } catch (e) { /* ignore */ }
     }
 
     _refreshIfStale() {
+        // In a rate-limit cooldown? Don't even try — show the age/cooldown line.
+        if (Date.now() < this._cooldownUntil) {
+            this._updateAgeLine();
+            return;
+        }
         const debounce = (this.clickDebounceSeconds == null) ? 5 : this.clickDebounceSeconds;
         const ageMs = Date.now() - this._lastFetchAt;
         if (this._lastFetchAt && ageMs < debounce * 1000) {
@@ -162,6 +173,17 @@ class ClaudeQuotaApplet extends Applet.TextIconApplet {
 
     _updateAgeLine() {
         if (!this._statusItem) return;
+
+        // Cooldown after a 429 takes priority — we want the user to know.
+        const remainCool = Math.ceil((this._cooldownUntil - Date.now()) / 1000);
+        if (remainCool > 0) {
+            const m = Math.floor(remainCool / 60);
+            const s = remainCool % 60;
+            const fmt = m > 0 ? (m + "m " + s + "s") : (s + "s");
+            this._statusItem.label.set_text(
+                "Rate-limited — cooling down · retry in " + fmt);
+            return;
+        }
         if (!this._lastFetchAt) {
             this._statusItem.label.set_text("Click the icon to load.");
             return;
@@ -255,6 +277,12 @@ class ClaudeQuotaApplet extends Applet.TextIconApplet {
         // Guard against overlapping fetches (e.g. user clicking rapidly).
         if (this._inFlight) return;
 
+        // Honor the 429 cooldown so we don't keep poking the same wall.
+        if (Date.now() < this._cooldownUntil) {
+            this._updateAgeLine();
+            return;
+        }
+
         const token = this._readToken();
         if (!token) {
             this._showError("No Claude credentials",
@@ -299,8 +327,14 @@ class ClaudeQuotaApplet extends Applet.TextIconApplet {
                 }
 
                 if (httpCode === 429) {
+                    // Enter a 2-minute cooldown so further clicks don't pile on.
+                    // If auto-refresh is on, also schedule a longer wait.
+                    this._cooldownUntil = Date.now() + 120 * 1000;
                     this._showError("Rate limited (429)",
-                        "Turn off auto-refresh or raise the interval.");
+                        "Cooling down for 2 min. Turn off auto-refresh if it's on.");
+                    // Schedule a one-shot tick so the countdown updates while the
+                    // popup stays open.
+                    this._scheduleCooldownTicks();
                     return;
                 }
                 if (httpCode === 401 || httpCode === 403) {
@@ -341,6 +375,28 @@ class ClaudeQuotaApplet extends Applet.TextIconApplet {
 
     _showError(title, detail) {
         this._lastError = title + (detail ? ": " + detail : "");
+
+        // If we have prior good data, KEEP showing it in the panel — flagging
+        // staleness with the alert icon and the popup status line. This way a
+        // transient 429 doesn't wipe your real numbers.
+        if (this._lastData) {
+            // Re-run the normal render (preserves panel label / bars), then
+            // override the icon to alert and the tooltip to surface the error.
+            this._render();
+            this.set_applet_icon_path(ICON_ALERT);
+            this.set_applet_tooltip("Claude quota — " + title +
+                (detail ? "\n" + detail : "") +
+                "\n(showing last cached values)");
+            if (this._statusItem) {
+                this._statusItem.label.set_text(this._lastError);
+            }
+            // The cooldown line, if any, takes priority — refresh after the
+            // override so the user sees the countdown.
+            this._updateAgeLine();
+            return;
+        }
+
+        // No prior data — fall back to the visible error state.
         this.set_applet_label(" ?");
         this.set_applet_icon_path(ICON_ALERT);
         this.set_applet_tooltip("Claude quota — " + title +
@@ -348,6 +404,25 @@ class ClaudeQuotaApplet extends Applet.TextIconApplet {
         if (this._statusItem) {
             this._statusItem.label.set_text(this._lastError);
         }
+    }
+
+    _scheduleCooldownTicks() {
+        if (this._cooldownTickTimeout > 0) {
+            Mainloop.source_remove(this._cooldownTickTimeout);
+            this._cooldownTickTimeout = 0;
+        }
+        const tick = () => {
+            this._updateAgeLine();
+            if (Date.now() >= this._cooldownUntil) {
+                this._cooldownTickTimeout = 0;
+                // Cooldown ended; if popup is open, gently restore the icon
+                // to its data-driven color (don't auto-fetch — user can click).
+                if (this._lastData) this._render();
+                return false; // stop
+            }
+            return true;
+        };
+        this._cooldownTickTimeout = Mainloop.timeout_add_seconds(1, tick);
     }
 
     // ----------------------------------------------------------------
