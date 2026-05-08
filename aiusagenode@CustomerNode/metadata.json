@@ -1,0 +1,7 @@
+{
+    "uuid": "aiusagenode@CustomerNode",
+    "name": "AI Usage Node",
+    "description": "Live Claude Code subscription usage in your panel: 5-hour window %, 7-day rolling % (and Opus/Sonnet sub-quotas when present), with absolute reset times and live countdowns. Reads /api/oauth/usage — same data as the /usage slash command. No API key required.",
+    "icon": "utilities-system-monitor",
+    "max-instances": 1
+}

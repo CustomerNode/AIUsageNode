@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24">
+  <!-- Alert variant: red -->
+  <path d="M12 1 Q13.2 11, 23 12 Q13.2 13, 12 23 Q10.8 13, 1 12 Q10.8 11, 12 1 Z"
+        fill="#e74c3c"/>
+  <path d="M19 4 Q19.4 6.6, 22 7 Q19.4 7.4, 19 10 Q18.6 7.4, 16 7 Q18.6 6.6, 19 4 Z"
+        fill="#e74c3c" opacity="0.55"/>
+</svg>

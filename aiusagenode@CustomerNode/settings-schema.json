@@ -1,0 +1,55 @@
+{
+    "refresh-seconds": {
+        "type": "spinbutton",
+        "default": 60,
+        "min": 15,
+        "max": 1800,
+        "units": "seconds",
+        "step": 15,
+        "description": "Refresh interval",
+        "tooltip": "How often to poll /api/oauth/usage. The endpoint is cheap, but no need to hammer it."
+    },
+    "show-panel-label": {
+        "type": "switch",
+        "default": true,
+        "description": "Show percentage in panel",
+        "tooltip": "Turn off to show only the sparkle icon in the panel; click it to see percentages in the popup."
+    },
+    "label-format": {
+        "type": "combobox",
+        "default": "5h_and_7d",
+        "description": "Panel label format",
+        "dependency": "show-panel-label",
+        "options": {
+            "5h / 7d (e.g. 22/15%)": "5h_and_7d",
+            "5-hour only (e.g. 22%)": "5h_only",
+            "7-day only (e.g. 15%)": "7d_only",
+            "Max of all (e.g. 22%)": "max"
+        }
+    },
+    "warn-threshold": {
+        "type": "spinbutton",
+        "default": 75,
+        "min": 0,
+        "max": 100,
+        "units": "%",
+        "step": 5,
+        "description": "Warning threshold (yellow icon)",
+        "tooltip": "When the highest utilization crosses this, the panel icon switches to a warning style."
+    },
+    "alert-threshold": {
+        "type": "spinbutton",
+        "default": 90,
+        "min": 0,
+        "max": 100,
+        "units": "%",
+        "step": 5,
+        "description": "Alert threshold (red icon)"
+    },
+    "terminal-command": {
+        "type": "entry",
+        "default": "gnome-terminal -- bash -lc 'claude'",
+        "description": "Terminal command",
+        "tooltip": "Command run by 'Open Claude in terminal' menu item."
+    }
+}
