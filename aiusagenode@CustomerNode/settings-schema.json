@@ -1,13 +1,30 @@
 {
+    "auto-refresh": {
+        "type": "switch",
+        "default": false,
+        "description": "Auto-refresh on a timer",
+        "tooltip": "When off (recommended), the applet only fetches when you click the icon or pick Refresh now. Turn on to also poll on a timer — but be aware this can hit Claude's rate limits if set too aggressive."
+    },
     "refresh-seconds": {
         "type": "spinbutton",
-        "default": 60,
-        "min": 15,
-        "max": 1800,
+        "default": 600,
+        "min": 60,
+        "max": 3600,
         "units": "seconds",
-        "step": 15,
-        "description": "Refresh interval",
-        "tooltip": "How often to poll /api/oauth/usage. The endpoint is cheap, but no need to hammer it."
+        "step": 60,
+        "description": "Auto-refresh interval",
+        "dependency": "auto-refresh",
+        "tooltip": "Seconds between automatic polls. Only used when Auto-refresh is on."
+    },
+    "click-debounce-seconds": {
+        "type": "spinbutton",
+        "default": 5,
+        "min": 0,
+        "max": 60,
+        "units": "seconds",
+        "step": 1,
+        "description": "Skip refetch if data is newer than (s)",
+        "tooltip": "When you click the icon, skip the network call if the cached data is fresher than this. 0 = always refetch on click."
     },
     "show-panel-label": {
         "type": "switch",

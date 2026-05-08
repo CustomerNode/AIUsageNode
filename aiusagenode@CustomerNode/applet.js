@@ -1,10 +1,7 @@
-// AI Usage Node — Cinnamon panel applet
+// Claude Quota — Cinnamon panel applet
 // Reads ~/.claude/.credentials.json and calls
 // https://api.anthropic.com/api/oauth/usage (same endpoint Claude Code's
 // /usage slash command uses) to display percentage-based subscription usage.
-//
-// https://github.com/CustomerNode/AIUsageNode
-// MIT License
 
 const Applet = imports.ui.applet;
 const PopupMenu = imports.ui.popupMenu;
@@ -108,19 +105,23 @@ class ClaudeQuotaApplet extends Applet.TextIconApplet {
         this._refreshTimeout = 0;
         this._lastData = null;
         this._lastError = null;
+        this._lastFetchAt = 0;     // ms epoch of last successful fetch
+        this._inFlight = false;    // network call currently running
 
         this.set_applet_icon_path(ICON_OK);
         this.set_applet_label(" …");
-        this.set_applet_tooltip("Claude usage — loading");
+        this.set_applet_tooltip("Claude usage — click to load");
 
         // Settings (must come before menu construction so terminalCommand is bound)
         this.settings = new Settings.AppletSettings(this, UUID, instanceId);
-        this.settings.bind("refresh-seconds",  "refreshSeconds",  () => this._scheduleRefresh());
-        this.settings.bind("show-panel-label", "showPanelLabel",  () => this._render());
-        this.settings.bind("label-format",     "labelFormat",     () => this._render());
-        this.settings.bind("warn-threshold",   "warnThreshold",   () => this._render());
-        this.settings.bind("alert-threshold",  "alertThreshold",  () => this._render());
-        this.settings.bind("terminal-command", "terminalCommand", () => {});
+        this.settings.bind("auto-refresh",          "autoRefresh",         () => this._scheduleRefresh());
+        this.settings.bind("refresh-seconds",       "refreshSeconds",      () => this._scheduleRefresh());
+        this.settings.bind("click-debounce-seconds","clickDebounceSeconds",() => {});
+        this.settings.bind("show-panel-label",      "showPanelLabel",      () => this._render());
+        this.settings.bind("label-format",          "labelFormat",         () => this._render());
+        this.settings.bind("warn-threshold",        "warnThreshold",       () => this._render());
+        this.settings.bind("alert-threshold",       "alertThreshold",      () => this._render());
+        this.settings.bind("terminal-command",      "terminalCommand",     () => {});
 
         // Popup menu
         this.menuManager = new PopupMenu.PopupMenuManager(this);
@@ -128,12 +129,16 @@ class ClaudeQuotaApplet extends Applet.TextIconApplet {
         this.menuManager.addMenu(this.menu);
         this._buildMenu();
 
-        // Kick off
+        // Initial fetch on load (so the panel shows real numbers right away),
+        // then auto-refresh only if user opted in.
         this._refresh();
     }
 
     on_applet_clicked(event) {
+        // Open the popup immediately, then maybe trigger a refresh in the
+        // background. Any new data updates the popup in place.
         this.menu.toggle();
+        this._refreshIfStale();
     }
 
     on_applet_removed_from_panel() {
@@ -142,6 +147,39 @@ class ClaudeQuotaApplet extends Applet.TextIconApplet {
             this._refreshTimeout = 0;
         }
         try { this.settings.finalize(); } catch (e) { /* ignore */ }
+    }
+
+    _refreshIfStale() {
+        const debounce = (this.clickDebounceSeconds == null) ? 5 : this.clickDebounceSeconds;
+        const ageMs = Date.now() - this._lastFetchAt;
+        if (this._lastFetchAt && ageMs < debounce * 1000) {
+            // Recently fetched — skip the network call but make sure age line is fresh.
+            this._updateAgeLine();
+            return;
+        }
+        this._refresh();
+    }
+
+    _updateAgeLine() {
+        if (!this._statusItem) return;
+        if (!this._lastFetchAt) {
+            this._statusItem.label.set_text("Click the icon to load.");
+            return;
+        }
+        const ageS = Math.floor((Date.now() - this._lastFetchAt) / 1000);
+        let ageText;
+        if (ageS < 5)         ageText = "just now";
+        else if (ageS < 60)   ageText = ageS + " s ago";
+        else if (ageS < 3600) ageText = Math.floor(ageS / 60) + " min ago";
+        else                  ageText = Math.floor(ageS / 3600) + " h ago";
+        const stamp = new Date(this._lastFetchAt).toLocaleTimeString([], {
+            hour: "numeric", minute: "2-digit"
+        });
+        const mode = this.autoRefresh
+            ? ("auto every " + Math.round((this.refreshSeconds || 600) / 60) + " min")
+            : "click to refresh";
+        this._statusItem.label.set_text(
+            "Updated " + ageText + " · " + stamp + " · " + mode);
     }
 
     // ----------------------------------------------------------------
@@ -183,11 +221,14 @@ class ClaudeQuotaApplet extends Applet.TextIconApplet {
     // Refresh
     // ----------------------------------------------------------------
     _scheduleRefresh() {
+        // Cancel any existing timer first.
         if (this._refreshTimeout > 0) {
             Mainloop.source_remove(this._refreshTimeout);
             this._refreshTimeout = 0;
         }
-        const s = Math.max(15, this.refreshSeconds || 60);
+        // Only schedule when the user has opted into auto-refresh.
+        if (!this.autoRefresh) return;
+        const s = Math.max(60, this.refreshSeconds || 600);
         this._refreshTimeout = Mainloop.timeout_add_seconds(s, () => {
             this._refresh();
             return true;
@@ -211,19 +252,27 @@ class ClaudeQuotaApplet extends Applet.TextIconApplet {
     }
 
     _refresh() {
+        // Guard against overlapping fetches (e.g. user clicking rapidly).
+        if (this._inFlight) return;
+
         const token = this._readToken();
         if (!token) {
             this._showError("No Claude credentials",
                 "Run `claude` once in a terminal to log in.");
-            this._scheduleRefresh();
             return;
         }
+
+        // Use -w to capture the HTTP status code on its own line so we can
+        // detect 429 / 401 even when curl is silenced.
         const argv = [
             "/usr/bin/curl", "-sS", "--max-time", "10",
             "-H", "Authorization: Bearer " + token,
             "-H", "User-Agent: claude-quota-applet/1.0",
+            "-w", "\n__HTTP__%{http_code}",
             ENDPOINT
         ];
+        this._inFlight = true;
+        if (this._statusItem) this._statusItem.label.set_text("Fetching…");
         try {
             const proc = new Gio.Subprocess({
                 argv: argv,
@@ -231,40 +280,62 @@ class ClaudeQuotaApplet extends Applet.TextIconApplet {
             });
             proc.init(null);
             proc.communicate_utf8_async(null, null, (p, res) => {
-                let stdout = "", stderr = "";
+                this._inFlight = false;
+                let raw = "", stderr = "";
                 try {
                     const r = p.communicate_utf8_finish(res);
-                    stdout = r[1] || "";
+                    raw = r[1] || "";
                     stderr = r[2] || "";
                 } catch (e) {
                     this._showError("curl failed", e.message);
-                    this._scheduleRefresh();
                     return;
                 }
-                if (!stdout) {
+                // Split body and HTTP code (added by -w "\n__HTTP__%{http_code}").
+                let body = raw, httpCode = 0;
+                const m = raw.match(/^([\s\S]*)\n__HTTP__(\d+)\s*$/);
+                if (m) {
+                    body = m[1];
+                    httpCode = parseInt(m[2], 10);
+                }
+
+                if (httpCode === 429) {
+                    this._showError("Rate limited (429)",
+                        "Turn off auto-refresh or raise the interval.");
+                    return;
+                }
+                if (httpCode === 401 || httpCode === 403) {
+                    this._showError("Auth expired (" + httpCode + ")",
+                        "Run `claude` in a terminal to refresh your token.");
+                    return;
+                }
+                if (httpCode && (httpCode < 200 || httpCode >= 300)) {
+                    this._showError("HTTP " + httpCode,
+                        body.slice(0, 80) || stderr.slice(0, 80));
+                    return;
+                }
+                if (!body || !body.trim()) {
                     this._showError("API: empty response", stderr.slice(0, 80));
-                    this._scheduleRefresh();
                     return;
                 }
                 try {
-                    const data = JSON.parse(stdout);
+                    const data = JSON.parse(body);
                     if (data && (data.error || data.type === "error")) {
                         const msg = (data.error && data.error.message) ||
                                     data.message || data.type || "unknown error";
                         this._showError("API error", String(msg).slice(0, 100));
-                    } else {
-                        this._lastData = data;
-                        this._lastError = null;
-                        this._render();
+                        return;
                     }
+                    this._lastData = data;
+                    this._lastError = null;
+                    this._lastFetchAt = Date.now();
+                    this._render();
                 } catch (e) {
                     this._showError("Parse error", e.message);
                 }
-                this._scheduleRefresh();
             });
         } catch (e) {
+            this._inFlight = false;
             this._showError("Spawn error", e.message);
-            this._scheduleRefresh();
         }
     }
 
@@ -342,9 +413,8 @@ class ClaudeQuotaApplet extends Applet.TextIconApplet {
         ttLine("7-day Sonnet", d.seven_day_sonnet);
         this.set_applet_tooltip(tt.join("\n"));
 
-        // Status line
-        this._statusItem.label.set_text(
-            "Updated " + new Date().toLocaleTimeString());
+        // Status / age line ("Updated just now" / "Updated 8 min ago")
+        this._updateAgeLine();
 
         // Bars
         this._barSection.removeAll();
