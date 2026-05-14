@@ -264,24 +264,52 @@ function Invoke-UsageFetch {
         }
 
         if ($code -eq 429) {
-            # The strongly-typed Headers.RetryAfter exposes whichever form the
-            # server used (Delta = relative seconds, Date = absolute HTTP-date).
             $serverWait = 0
             $serverWaitSource = 'none'
             $rawRetryAfter = $headerDump['Retry-After']
+
+            # Path 1: strongly-typed property. Works on most PS versions but
+            # PowerShell's binding of .NET nullable<T> properties has caused
+            # silent zero-reads in the wild, so it's only the first attempt.
             try {
                 $ra = $resp.Headers.RetryAfter
                 if ($ra) {
-                    if ($ra.Delta.HasValue) {
-                        $serverWait = [int]$ra.Delta.Value.TotalSeconds
+                    $delta = $ra.Delta
+                    if ($delta -and $delta.TotalSeconds -gt 0) {
+                        $serverWait = [int]$delta.TotalSeconds
                         $serverWaitSource = 'Delta'
-                    } elseif ($ra.Date.HasValue) {
-                        $serverWait = [int]($ra.Date.Value - [DateTimeOffset]::UtcNow).TotalSeconds
-                        if ($serverWait -lt 0) { $serverWait = 0 }
-                        $serverWaitSource = 'Date'
+                    } else {
+                        $date = $ra.Date
+                        if ($date) {
+                            $serverWait = [int]($date - [DateTimeOffset]::UtcNow).TotalSeconds
+                            if ($serverWait -lt 0) { $serverWait = 0 }
+                            $serverWaitSource = 'Date'
+                        }
                     }
                 }
             } catch {}
+
+            # Path 2: fall back to manually parsing the raw header string we
+            # already pulled into the dump. This is what saves us when the
+            # typed accessor silently returns null.
+            if ($serverWait -le 0 -and $rawRetryAfter) {
+                $secInt = 0
+                if ([int]::TryParse($rawRetryAfter, [ref]$secInt)) {
+                    if ($secInt -gt 0) {
+                        $serverWait = $secInt
+                        $serverWaitSource = 'raw-seconds'
+                    }
+                } else {
+                    try {
+                        $until = [DateTimeOffset]::Parse($rawRetryAfter)
+                        $diff = [int]($until - [DateTimeOffset]::UtcNow).TotalSeconds
+                        if ($diff -gt 0) {
+                            $serverWait = $diff
+                            $serverWaitSource = 'raw-http-date'
+                        }
+                    } catch {}
+                }
+            }
 
             $script:Consecutive429s = $script:Consecutive429s + 1
 
