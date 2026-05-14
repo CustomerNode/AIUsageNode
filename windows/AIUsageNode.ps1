@@ -804,19 +804,17 @@ $notifyIcon.Add_MouseDoubleClick({
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 30 * 1000
 $timer.Add_Tick({
-    # Always refresh the tooltip so the cooldown countdown ticks down live
-    # even when no fetch happens.
+    # Refresh the tooltip so the cooldown countdown ticks down live, even
+    # though no fetch ever happens from this timer.
     Update-Tray $notifyIcon
 
-    $cooldownClear = (-not $script:CooldownUntil) -or ([DateTime]::UtcNow -ge $script:CooldownUntil)
-    if ($script:LastError -and $cooldownClear) {
-        if ((-not $script:LastRetryAt) -or ([DateTime]::UtcNow - $script:LastRetryAt).TotalSeconds -ge 60) {
-            $script:LastRetryAt = [DateTime]::UtcNow
-            Invoke-Refresh $notifyIcon
-            return
-        }
-    }
-
+    # Auto-retry on error is intentionally NOT done here. Background retries
+    # were the root cause of an extended rate-limit incident: each retry
+    # against /api/oauth/usage got a fresh 47-min Retry-After, and a buggy
+    # parse fell back to a shorter local cooldown, so the script kept
+    # hammering and the rate-limit window kept resetting. The tray is now
+    # manual-only -- only an explicit click or a context-menu "Refresh now"
+    # makes an HTTP call.
     if (-not $script:Settings['auto-refresh']) { return }
     $every = [int]$script:Settings['refresh-seconds']
     if ($every -lt 60) { $every = 60 }
