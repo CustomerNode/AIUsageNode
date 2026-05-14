@@ -14,6 +14,8 @@ $script:AppName       = 'AI Usage Node'
 $script:AppDir        = Join-Path $env:LOCALAPPDATA 'AIUsageNode'
 $script:SettingsPath  = Join-Path $script:AppDir 'settings.json'
 $script:RateStatePath = Join-Path $script:AppDir 'rate-state.json'
+$script:LastDataPath  = Join-Path $script:AppDir 'last-data.json'
+$script:EventLogPath  = Join-Path $script:AppDir 'events.log'
 $script:CredsPath     = Join-Path $env:USERPROFILE '.claude\.credentials.json'
 $script:Endpoint      = 'https://api.anthropic.com/api/oauth/usage'
 $script:UserAgent     = 'claude-quota-applet-windows/1.0'
@@ -28,6 +30,18 @@ $script:Consecutive429s  = 0     # for exponential backoff
 $script:InFlight         = $false
 $script:LastRetryAt      = $null # last error-recovery retry attempt
 $script:LastBalloonStatus = $null # last status we balloon-notified about (suppress repeats)
+
+# ===== Event log =====
+# Every meaningful event (click, fetch start, fetch result, timer decision)
+# appends a line to events.log so we can see exactly what the script did
+# without guessing.
+function Write-Event($category, $message) {
+    try {
+        if (-not (Test-Path $script:AppDir)) { New-Item -ItemType Directory -Path $script:AppDir -Force | Out-Null }
+        $line = "{0}  [{1}]  {2}" -f ([DateTime]::UtcNow.ToString('yyyy-MM-dd HH:mm:ss.fff')), $category, $message
+        Add-Content -Path $script:EventLogPath -Value $line -Encoding UTF8
+    } catch {}
+}
 
 # ===== Settings =====
 $script:DefaultSettings = [ordered]@{
@@ -115,6 +129,54 @@ function Clear-RateState {
 }
 
 Load-RateState
+
+# ===== Last-good data persistence =====
+# /api/oauth/usage rate-limits hard (typically Retry-After: 3600), and the
+# subscription utilization data is the SAME until either the 5-hour window
+# resets or the user actually consumes more quota. Losing the last successful
+# 200 on every tray restart -- which was the previous behavior -- meant the
+# user spent most of their day staring at a grey icon while the script
+# cooled down from a 429 it triggered trying to "freshen" data that was
+# already perfectly usable. We persist the raw response body so:
+#   1. Restarting the tray instantly shows the last-known usage instead of
+#      "Loading...".
+#   2. When a cooldown is active on startup, the user still sees real data
+#      with a cooldown notice, instead of a blank red icon.
+#   3. We can suppress the auto-fetch-on-startup when cached data is fresh
+#      enough that another request would just burn a request-slot for no
+#      visible benefit.
+# We store the original JSON body (not the parsed object) to keep the
+# round-trip deterministic across PS versions; ConvertFrom-Json reads it
+# back into the same shape every parse path uses.
+function Save-LastData($rawBody) {
+    if (-not $rawBody) { return }
+    try {
+        $payload = [PSCustomObject]@{
+            fetchedAtUtc = [DateTime]::UtcNow.ToString('o')
+            body         = $rawBody
+        }
+        $payload | ConvertTo-Json -Depth 5 | Set-Content $script:LastDataPath -Encoding UTF8
+    } catch {}
+}
+
+function Load-LastData {
+    if (-not (Test-Path $script:LastDataPath)) { return }
+    try {
+        $payload = Get-Content $script:LastDataPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        if (-not $payload.body) { return }
+        $parsed = $payload.body | ConvertFrom-Json
+        if (-not $parsed) { return }
+        $script:LastData    = $parsed
+        if ($payload.fetchedAtUtc) {
+            $script:LastFetchAt = [DateTime]::Parse($payload.fetchedAtUtc, $null, [System.Globalization.DateTimeStyles]::AssumeUniversal -bor [System.Globalization.DateTimeStyles]::AdjustToUniversal)
+        }
+    } catch {
+        # Corrupt cache is non-fatal; the tray will just behave as if it
+        # had no prior data and (on user action) try to fetch fresh.
+    }
+}
+
+Load-LastData
 
 # ===== Credential read =====
 function Get-OAuthToken {
@@ -222,18 +284,24 @@ function New-StatusIcon([System.Drawing.Color]$color) {
 Add-Type -AssemblyName System.Net.Http -ErrorAction SilentlyContinue
 
 function Invoke-UsageFetch {
+    Write-Event 'fetch' "Invoke-UsageFetch called. CooldownUntil=$(if($script:CooldownUntil){$script:CooldownUntil.ToString('o')}else{'(null)'})  Now=$([DateTime]::UtcNow.ToString('o'))  InFlight=$($script:InFlight)"
+
     # Returns @{ ok=$true; data=... } or @{ ok=$false; status=N; title=...; detail=... }
     if ($script:CooldownUntil -and ([DateTime]::UtcNow -lt $script:CooldownUntil)) {
+        Write-Event 'fetch' "BLOCKED: cooldown active until $($script:CooldownUntil.ToString('o'))"
         return @{ ok = $false; title = 'Cooling down'; detail = 'Rate-limit cooldown active.' }
     }
     if ($script:InFlight) {
+        Write-Event 'fetch' 'BLOCKED: previous fetch still in flight'
         return @{ ok = $false; title = 'Busy'; detail = 'Previous fetch still in flight.' }
     }
     $token = Get-OAuthToken
     if (-not $token) {
+        Write-Event 'fetch' 'BLOCKED: no OAuth token in credentials file'
         return @{ ok = $false; title = 'No Claude credentials'; detail = 'Run `claude` once in a terminal to log in.' }
     }
 
+    Write-Event 'fetch' "PROCEEDING with HTTP GET to $($script:Endpoint)"
     $script:InFlight = $true
     try {
         $client = New-Object System.Net.Http.HttpClient
@@ -245,10 +313,12 @@ function Invoke-UsageFetch {
         try {
             $resp = $client.SendAsync($req).GetAwaiter().GetResult()
         } catch {
+            Write-Event 'fetch' "NETWORK ERROR: $($_.Exception.Message)"
             return @{ ok = $false; title = 'Network error'; detail = $_.Exception.Message }
         }
 
         $code = [int]$resp.StatusCode
+        Write-Event 'fetch' "RESPONSE status=$code"
         $body = ''
         try { $body = $resp.Content.ReadAsStringAsync().GetAwaiter().GetResult() } catch { $body = '' }
 
@@ -327,6 +397,7 @@ function Invoke-UsageFetch {
             $script:CooldownUntil = [DateTime]::UtcNow.AddSeconds($waitSec)
             $script:CooldownSecs  = $waitSec
             Save-RateState
+            Write-Event 'fetch' "429: rawRetryAfter='$rawRetryAfter' serverWait=${serverWait}s($serverWaitSource) waitUsed=${waitSec}s($waitSource) consecutive=$($script:Consecutive429s) cooldownUntil=$($script:CooldownUntil.ToString('o'))"
 
             # Dump full 429 to disk for debugging and so the user can verify
             # we're honoring what the server actually sent.
@@ -379,6 +450,11 @@ function Invoke-UsageFetch {
         $script:LastError        = $null
         $script:LastFetchAt      = [DateTime]::UtcNow
         Clear-RateState          # reset backoff counter and on-disk state
+        # Persist the successful response so a tray restart does NOT lose
+        # it. Without this, every restart blanks the cached usage and the
+        # user has to spend a request to re-learn data we already had.
+        Save-LastData $body
+        Write-Event 'fetch' "200 OK: parsed successfully (body length $($body.Length)); cached to disk"
         return @{ ok = $true; data = $data }
     }
     finally {
@@ -763,7 +839,7 @@ $notifyIcon.Text    = "$script:AppName - loading..."
 $notifyIcon.Visible = $true
 
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
-$null = $menu.Items.Add('Refresh now', $null, { Invoke-Refresh $notifyIcon })
+$null = $menu.Items.Add('Refresh now', $null, { Write-Event 'click' "Refresh now (context menu)"; Invoke-Refresh $notifyIcon })
 $null = $menu.Items.Add('Open Claude in terminal', $null, { Open-ClaudeTerminal })
 $null = $menu.Items.Add('Edit settings', $null, { Open-SettingsFile })
 $null = $menu.Items.Add('Reload settings', $null, { $script:Settings = Load-Settings; Update-Tray $notifyIcon })
@@ -780,15 +856,37 @@ $notifyIcon.ContextMenuStrip = $menu
 $notifyIcon.Add_MouseClick({
     param($sender, $e)
     if ($e.Button -ne [System.Windows.Forms.MouseButtons]::Left) { return }
+
+    # Toggle: if the popup is already open, this click closes it. No fetch.
+    if ($script:PopupForm -and -not $script:PopupForm.IsDisposed) {
+        Write-Event 'click' 'Left single-click: popup open, closing'
+        $script:PopupForm.Close()
+        return
+    }
+
+    Write-Event 'click' 'Left single-click: opening popup'
+
+    # Single-click is a CHEAP gesture: it only fetches when we genuinely have
+    # nothing to show (no prior successful response) AND the cooldown is
+    # clear AND nothing else is in flight. Once we have data, single-click
+    # just shows it. /api/oauth/usage rate-limits to ~1 request/hour, so
+    # refetching on every popup open is hostile -- it caused this exact
+    # bug: a successful 200 followed by a click 2 min later got a fresh
+    # 60-min 429. Force-refresh is double-click or Refresh now.
+    $cooldownClear = (-not $script:CooldownUntil) -or ([DateTime]::UtcNow -ge $script:CooldownUntil)
+    if ((-not $script:LastData) -and $cooldownClear -and (-not $script:InFlight)) {
+        Write-Event 'click' "Triggering refresh on open (no data yet, cooldown clear)"
+        Invoke-Refresh $notifyIcon
+    } else {
+        Write-Event 'click' "Skipping refresh (hasData=$($null -ne $script:LastData) cooldownClear=$cooldownClear inFlight=$($script:InFlight))"
+    }
+
     Show-UsagePopup
 })
 $notifyIcon.Add_MouseDoubleClick({
     param($sender, $e)
     if ($e.Button -ne [System.Windows.Forms.MouseButtons]::Left) { return }
-    # If we've never fetched OR the previous fetch is older than the debounce
-    # window, kick off a fresh fetch. Previously this only refreshed when
-    # LastFetchAt was already set, which meant double-clicking did nothing
-    # before the very first successful fetch.
+    Write-Event 'click' "Left double-click (LastFetchAt=$(if($script:LastFetchAt){$script:LastFetchAt.ToString('o')}else{'(null)'}))"
     $debounce = [int]$script:Settings['click-debounce-seconds']
     $stale = (-not $script:LastFetchAt) -or (([DateTime]::UtcNow - $script:LastFetchAt).TotalSeconds -ge $debounce)
     if ($stale) {
@@ -797,6 +895,8 @@ $notifyIcon.Add_MouseDoubleClick({
             $script:PopupForm.Close()
             Show-UsagePopup
         }
+    } else {
+        Write-Event 'click' "Double-click skipped (within ${debounce}s debounce)"
     }
 })
 
@@ -836,8 +936,35 @@ $timer.Add_Tick({
 })
 $timer.Start()
 
-# Initial fetch
-Invoke-Refresh $notifyIcon
+# Initial render: paint the tray with whatever we already have on disk
+# (cached usage data, restored cooldown state, etc.) before considering an
+# API call. This makes restart feel instant -- the user sees real numbers
+# right away instead of "Loading..." -- and means a startup during an
+# active cooldown does not look like a fresh failure.
+$cachedAgeSec = if ($script:LastFetchAt) { [int]([DateTime]::UtcNow - $script:LastFetchAt).TotalSeconds } else { $null }
+Write-Event 'startup' "Tray launching. PID=$PID  Cooldown=$(if($script:CooldownUntil){$script:CooldownUntil.ToString('o')}else{'(none)'})  LastError=$(if($script:LastError){$script:LastError.title}else{'(none)'})  CachedDataAgeSec=$(if($null -ne $cachedAgeSec){$cachedAgeSec}else{'(no cache)'})"
+Update-Tray $notifyIcon
+
+# Initial fetch policy:
+#   - If cooldown is active: do not even try; Invoke-Refresh would just set
+#     a fresh "Cooling down" error on top of whatever the user already sees.
+#   - If we have cached data younger than 5 minutes: skip the fetch. The
+#     data is still meaningful and the endpoint rate-limits to roughly one
+#     request per hour -- spending that request on data we already have
+#     fresh is exactly the kind of hostile auto-fetch we are trying to
+#     avoid.
+#   - Otherwise (no cache, or cache is stale): kick off the one allowed
+#     auto-fetch so the user sees current numbers without having to click.
+$cooldownActive = $script:CooldownUntil -and ([DateTime]::UtcNow -lt $script:CooldownUntil)
+$cacheFresh     = ($null -ne $cachedAgeSec) -and ($cachedAgeSec -lt 300)
+if ($cooldownActive) {
+    Write-Event 'startup' 'Skipping initial fetch: cooldown active.'
+} elseif ($cacheFresh) {
+    Write-Event 'startup' "Skipping initial fetch: cached data is fresh (${cachedAgeSec}s old)."
+} else {
+    Write-Event 'startup' 'Initial fetch: no fresh cache, kicking off one auto-fetch.'
+    Invoke-Refresh $notifyIcon
+}
 
 # Run message loop. Returns when Application.Exit() is called.
 [System.Windows.Forms.Application]::Run()

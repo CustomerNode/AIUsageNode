@@ -137,9 +137,19 @@ By default Windows 11 hides new tray icons under the `^` overflow chevron. You h
 | Gesture | Action |
 |---|---|
 | Hover | Tooltip shows the headline percentages |
-| Single left-click | Popup window with bars + reset times (toggle — clicking again closes it; clicking outside closes it; Esc closes it) |
+| Single left-click | Popup with bars + reset times (toggle — clicking again closes; clicking outside closes; Esc closes). Triggers a fetch **only** when there is no cached data yet and no active cooldown — never on every click. |
 | Double left-click | Force a refresh (respecting the debounce setting) |
 | Right-click | Context menu: Refresh now / Open Claude in terminal / Edit settings / Reload settings / Exit |
+
+### Rate-limit behavior
+
+`/api/oauth/usage` rate-limits aggressively — usually `Retry-After: 3600` after a 429. The Windows tray is built to **not** make that worse:
+
+- **No background retry-on-error.** When a fetch fails (429 or anything else), the icon turns red and the tooltip explains why; the script never auto-retries. The only outbound HTTP calls are the one-shot fetch at startup, your explicit click, or your opt-in auto-refresh timer.
+- **Cooldown is honored exactly as the server states.** A 429 with `Retry-After: 3600` produces a 1-hour cooldown; during that window every refresh path is a no-op. The full 429 response (headers + body) is dumped to `%LOCALAPPDATA%\AIUsageNode\last-429.json` for inspection.
+- **Cooldown survives restarts.** Killing and relaunching the tray will not "reset" the backoff and trigger another 429 against the same wall.
+- **Last successful response is cached on disk** at `%LOCALAPPDATA%\AIUsageNode\last-data.json`. Restarting the tray after a successful fetch shows the cached numbers instantly; if the cache is younger than five minutes, the startup auto-fetch is skipped entirely — the data is good, no point spending a request-slot on it. Older cache is still shown immediately on launch, then refreshed in the normal way.
+- **Event log** at `%LOCALAPPDATA%\AIUsageNode\events.log` records every click, fetch decision, and HTTP result with millisecond timestamps so you can see exactly what the tray did, when, and why.
 
 ### Configure
 
@@ -202,7 +212,7 @@ The response looks like:
 }
 ```
 
-That's it. The clients cache nothing, store nothing, and never send anything anywhere except that one Anthropic request. If the token expires, run `claude` once in a terminal to refresh it; the icon recovers on its next poll.
+That's it. Neither client sends anything anywhere except that one Anthropic request. The Linux applet keeps state in memory; the Windows tray additionally caches the last successful response, rate-limit cooldown state, and an event log under `%LOCALAPPDATA%\AIUsageNode\` so a restart doesn't blank the display or trip the same rate-limit. Nothing is uploaded — all caching is local. If the token expires, run `claude` once in a terminal to refresh it; the icon recovers on its next poll.
 
 ## License
 
