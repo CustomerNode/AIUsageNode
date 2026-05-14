@@ -18,11 +18,15 @@ $script:Endpoint      = 'https://api.anthropic.com/api/oauth/usage'
 $script:UserAgent     = 'claude-quota-applet-windows/1.0'
 
 # ===== State =====
-$script:LastData       = $null
-$script:LastError      = $null
-$script:LastFetchAt    = $null
-$script:CooldownUntil  = $null
-$script:InFlight       = $false
+$script:LastData         = $null
+$script:LastError        = $null
+$script:LastFetchAt      = $null
+$script:CooldownUntil    = $null
+$script:CooldownSecs     = 0     # last cooldown duration (for display / next-backoff calc)
+$script:Consecutive429s  = 0     # for exponential backoff
+$script:InFlight         = $false
+$script:LastRetryAt      = $null # last error-recovery retry attempt
+$script:LastBalloonStatus = $null # last status we balloon-notified about (suppress repeats)
 
 # ===== Settings =====
 $script:DefaultSettings = [ordered]@{
@@ -199,8 +203,43 @@ function Invoke-UsageFetch {
         }
 
         if ($code -eq 429) {
-            $script:CooldownUntil = [DateTime]::UtcNow.AddSeconds(120)
-            return @{ ok = $false; status = 429; title = 'Rate limited (429)'; detail = 'Cooling down for 2 min.' }
+            # Honor Retry-After if the server sent one (RFC 7231: seconds OR HTTP-date).
+            $serverWait = 0
+            try {
+                $raw = $null
+                if ($resp -and $resp.Headers -and $resp.Headers['Retry-After']) {
+                    $raw = $resp.Headers['Retry-After']
+                } elseif ($exc -and $exc.Response -and $exc.Response.Headers) {
+                    $raw = $exc.Response.Headers['Retry-After']
+                }
+                if ($raw) {
+                    $secInt = 0
+                    if ([int]::TryParse([string]$raw, [ref]$secInt)) {
+                        $serverWait = $secInt
+                    } else {
+                        try {
+                            $until = [DateTimeOffset]::Parse([string]$raw)
+                            $serverWait = [int]($until - [DateTimeOffset]::UtcNow).TotalSeconds
+                        } catch {}
+                    }
+                }
+            } catch {}
+
+            # Exponential backoff on consecutive 429s.
+            $script:Consecutive429s = $script:Consecutive429s + 1
+            $backoffSec = [int]([Math]::Min(1800, [Math]::Pow(2, [Math]::Min($script:Consecutive429s, 8)) * 60))
+            $waitSec = [Math]::Max($serverWait, $backoffSec)
+            if ($waitSec -lt 60) { $waitSec = 60 }
+
+            $script:CooldownUntil = [DateTime]::UtcNow.AddSeconds($waitSec)
+            $script:CooldownSecs  = $waitSec
+
+            $minutes = [int][Math]::Ceiling($waitSec / 60.0)
+            $reason = "Rate limited (429)"
+            $note = "Cooling down ${minutes} min"
+            if ($serverWait -gt 0) { $note += " (server asked for ${serverWait} s)" }
+            if ($script:Consecutive429s -gt 1) { $note += "; consecutive 429 #$($script:Consecutive429s)" }
+            return @{ ok = $false; status = 429; title = $reason; detail = $note }
         }
         if ($code -eq 401 -or $code -eq 403) {
             return @{ ok = $false; status = $code; title = "Auth expired ($code)"; detail = 'Run `claude` in a terminal to refresh your token.' }
@@ -225,9 +264,12 @@ function Invoke-UsageFetch {
             $msgStr = "$msg"
             return @{ ok = $false; title = 'API error'; detail = $msgStr.Substring(0, [Math]::Min(100, $msgStr.Length)) }
         }
-        $script:LastData    = $data
-        $script:LastError   = $null
-        $script:LastFetchAt = [DateTime]::UtcNow
+        $script:LastData         = $data
+        $script:LastError        = $null
+        $script:LastFetchAt      = [DateTime]::UtcNow
+        $script:Consecutive429s  = 0  # reset backoff counter on success
+        $script:CooldownUntil    = $null
+        $script:CooldownSecs     = 0
         return @{ ok = $true; data = $data }
     }
     finally {
@@ -334,12 +376,20 @@ function Invoke-Refresh($notifyIcon) {
     $result = Invoke-UsageFetch
     if (-not $result.ok) {
         $script:LastError = @{ title = $result.title; detail = $result.detail }
-        if ($result.status -in 401,403,429) {
+        # Balloon only on a NEW error type (suppress repeats of the same status).
+        # The icon color + tooltip already convey the error state; we don't want
+        # the OS popping toast every retry while we're stuck in a rate-limit loop.
+        if ($result.status -in 401,403,429 -and $script:LastBalloonStatus -ne $result.status) {
             $notifyIcon.BalloonTipTitle = $result.title
             $notifyIcon.BalloonTipText  = $result.detail
             $notifyIcon.BalloonTipIcon  = [System.Windows.Forms.ToolTipIcon]::Warning
             $notifyIcon.ShowBalloonTip(5000)
+            $script:LastBalloonStatus = $result.status
         }
+    } else {
+        # Successful fetch clears the balloon-suppression latch so a future
+        # error WILL produce a fresh notification.
+        $script:LastBalloonStatus = $null
     }
     Update-Tray $notifyIcon
 }
@@ -570,10 +620,23 @@ $notifyIcon.Add_MouseDoubleClick({
     }
 })
 
-# Auto-refresh timer (ticks every 30s; only fetches when due)
+# Background timer (ticks every 30s).
+#  1. Always: auto-recover from a previous error once the cooldown has passed.
+#     This runs regardless of the auto-refresh setting, so a transient 429
+#     doesn't leave the tray stuck red until the user manually clicks.
+#  2. Opt-in: auto-refresh on the user's interval, when 'auto-refresh' is on.
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 30 * 1000
 $timer.Add_Tick({
+    $cooldownClear = (-not $script:CooldownUntil) -or ([DateTime]::UtcNow -ge $script:CooldownUntil)
+    if ($script:LastError -and $cooldownClear) {
+        if ((-not $script:LastRetryAt) -or ([DateTime]::UtcNow - $script:LastRetryAt).TotalSeconds -ge 60) {
+            $script:LastRetryAt = [DateTime]::UtcNow
+            Invoke-Refresh $notifyIcon
+            return
+        }
+    }
+
     if (-not $script:Settings['auto-refresh']) { return }
     $every = [int]$script:Settings['refresh-seconds']
     if ($every -lt 60) { $every = 60 }
