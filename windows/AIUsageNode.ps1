@@ -556,7 +556,7 @@ function Show-UsagePopup {
     $form.Controls.Add($header)
     $y += 30
 
-    # Status line
+    # Status line (one or two lines depending on whether a cooldown is active)
     $status = New-Object System.Windows.Forms.Label
     if ($script:LastError) {
         $status.Text = "(!) $($script:LastError.title)"
@@ -574,12 +574,39 @@ function Show-UsagePopup {
         $status.Text = 'Loading...'
         $status.ForeColor = [System.Drawing.Color]::FromArgb(170, 170, 170)
     }
-    $status.Font     = New-Object System.Drawing.Font 'Segoe UI', 8
-    $status.Location = New-Object System.Drawing.Point 14, $y
-    $status.Size     = New-Object System.Drawing.Size 350, 16
+    $status.Font      = New-Object System.Drawing.Font 'Segoe UI', 8
+    $status.Location  = New-Object System.Drawing.Point 14, $y
+    $status.Size      = New-Object System.Drawing.Size 350, 16
     $status.BackColor = [System.Drawing.Color]::Transparent
     $form.Controls.Add($status)
-    $y += 24
+    $y += 20
+
+    # Live cooldown line (only shown while CooldownUntil is in the future).
+    # A 1-second timer scoped to this form updates the text in place.
+    $cooldownLabel = New-Object System.Windows.Forms.Label
+    $cooldownLabel.Font      = New-Object System.Drawing.Font 'Segoe UI', 8, ([System.Drawing.FontStyle]::Bold)
+    $cooldownLabel.ForeColor = [System.Drawing.Color]::FromArgb(255, 167, 38)
+    $cooldownLabel.Location  = New-Object System.Drawing.Point 14, $y
+    $cooldownLabel.Size      = New-Object System.Drawing.Size 350, 16
+    $cooldownLabel.BackColor = [System.Drawing.Color]::Transparent
+    $cooldownText = Format-CooldownRemaining
+    if ($cooldownText) { $cooldownLabel.Text = $cooldownText; $cooldownLabel.Visible = $true; $y += 18 }
+    else               { $cooldownLabel.Visible = $false }
+    $form.Controls.Add($cooldownLabel)
+
+    # Detail line for the error message (also visible while cooling down).
+    if ($script:LastError -and $script:LastError.detail) {
+        $detail = New-Object System.Windows.Forms.Label
+        $detail.Text      = $script:LastError.detail
+        $detail.Font      = New-Object System.Drawing.Font 'Segoe UI', 8
+        $detail.ForeColor = [System.Drawing.Color]::FromArgb(180, 180, 180)
+        $detail.Location  = New-Object System.Drawing.Point 14, $y
+        $detail.Size      = New-Object System.Drawing.Size 350, 16
+        $detail.BackColor = [System.Drawing.Color]::Transparent
+        $form.Controls.Add($detail)
+        $y += 18
+    }
+    $y += 4
 
     # Bars
     $data = $script:LastData
@@ -676,10 +703,25 @@ function Show-UsagePopup {
     $screen = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
     $form.Location = New-Object System.Drawing.Point ($screen.Right - $form.Width - 12), ($screen.Bottom - $form.Height - 12)
 
-    # Close on deactivate or Escape
+    # 1-second timer for live cooldown countdown inside the popup.
+    $cdTimer = New-Object System.Windows.Forms.Timer
+    $cdTimer.Interval = 1000
+    $cdTimer.Add_Tick({
+        try {
+            $txt = Format-CooldownRemaining
+            if ($txt) { $cooldownLabel.Text = $txt; $cooldownLabel.Visible = $true }
+            else      { $cooldownLabel.Visible = $false }
+        } catch {}
+    }.GetNewClosure())
+    $cdTimer.Start()
+
+    # Close on deactivate or Escape. Always stop and dispose the timer.
     $form.Add_Deactivate({ try { $this.Close() } catch {} })
     $form.Add_KeyDown({ param($s, $e) if ($e.KeyCode -eq 'Escape') { $s.Close() } })
-    $form.Add_FormClosed({ $script:PopupForm = $null })
+    $form.Add_FormClosed({
+        try { $cdTimer.Stop(); $cdTimer.Dispose() } catch {}
+        $script:PopupForm = $null
+    }.GetNewClosure())
 
     $script:PopupForm = $form
     $form.Show()
