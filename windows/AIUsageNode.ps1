@@ -13,6 +13,7 @@ Add-Type -AssemblyName System.Drawing
 $script:AppName       = 'AI Usage Node'
 $script:AppDir        = Join-Path $env:LOCALAPPDATA 'AIUsageNode'
 $script:SettingsPath  = Join-Path $script:AppDir 'settings.json'
+$script:RateStatePath = Join-Path $script:AppDir 'rate-state.json'
 $script:CredsPath     = Join-Path $env:USERPROFILE '.claude\.credentials.json'
 $script:Endpoint      = 'https://api.anthropic.com/api/oauth/usage'
 $script:UserAgent     = 'claude-quota-applet-windows/1.0'
@@ -66,6 +67,54 @@ function Save-Settings($settings) {
 }
 
 $script:Settings = Load-Settings
+
+# ===== Rate-limit state persistence =====
+# Backoff state survives process restarts; otherwise restarting the tray
+# while still rate-limited would reset the counter back to a 2-min cooldown
+# even though the server is asking for much longer.
+function Load-RateState {
+    if (-not (Test-Path $script:RateStatePath)) { return }
+    try {
+        $j = Get-Content $script:RateStatePath -Raw | ConvertFrom-Json
+        if ($j.consecutive429s) { $script:Consecutive429s = [int]$j.consecutive429s }
+        if ($j.cooldownUntilUtc) {
+            $u = [DateTime]::Parse($j.cooldownUntilUtc, $null, [System.Globalization.DateTimeStyles]::AssumeUniversal -bor [System.Globalization.DateTimeStyles]::AdjustToUniversal)
+            if ($u -gt [DateTime]::UtcNow) {
+                $script:CooldownUntil = $u
+                $script:CooldownSecs  = [int]($u - [DateTime]::UtcNow).TotalSeconds
+                $script:LastError     = @{ title='Rate limited (carried)'; detail='Cooling down (state restored from disk).' }
+            }
+        }
+        # Forget very old state so we don't carry yesterday's backoff forever.
+        if ($j.lastFailureAtUtc) {
+            $last = [DateTime]::Parse($j.lastFailureAtUtc, $null, [System.Globalization.DateTimeStyles]::AssumeUniversal -bor [System.Globalization.DateTimeStyles]::AdjustToUniversal)
+            if (([DateTime]::UtcNow - $last).TotalHours -gt 6) {
+                $script:Consecutive429s = 0
+                $script:CooldownUntil   = $null
+            }
+        }
+    } catch {}
+}
+
+function Save-RateState {
+    try {
+        $state = [PSCustomObject]@{
+            consecutive429s   = $script:Consecutive429s
+            cooldownUntilUtc  = if ($script:CooldownUntil) { $script:CooldownUntil.ToString('o') } else { $null }
+            lastFailureAtUtc  = [DateTime]::UtcNow.ToString('o')
+        }
+        $state | ConvertTo-Json | Set-Content $script:RateStatePath -Encoding UTF8
+    } catch {}
+}
+
+function Clear-RateState {
+    $script:Consecutive429s = 0
+    $script:CooldownUntil   = $null
+    $script:CooldownSecs    = 0
+    if (Test-Path $script:RateStatePath) { Remove-Item $script:RateStatePath -Force -ErrorAction SilentlyContinue }
+}
+
+Load-RateState
 
 # ===== Credential read =====
 function Get-OAuthToken {
@@ -163,6 +212,15 @@ function New-StatusIcon([System.Drawing.Color]$color) {
 }
 
 # ===== API fetch =====
+# Uses System.Net.Http.HttpClient directly. This gives us a single response
+# type (HttpResponseMessage) regardless of PowerShell version, so header and
+# body reading work identically on Windows PowerShell 5.1 and PowerShell 7+.
+# Critically, this is what lets us actually read the Retry-After header --
+# the previous Invoke-WebRequest path silently lost headers when the response
+# came back via HttpResponseException on PS7.
+
+Add-Type -AssemblyName System.Net.Http -ErrorAction SilentlyContinue
+
 function Invoke-UsageFetch {
     # Returns @{ ok=$true; data=... } or @{ ok=$false; status=N; title=...; detail=... }
     if ($script:CooldownUntil -and ([DateTime]::UtcNow -lt $script:CooldownUntil)) {
@@ -178,74 +236,99 @@ function Invoke-UsageFetch {
 
     $script:InFlight = $true
     try {
-        $headers = @{
-            'Authorization' = "Bearer $token"
-            'User-Agent'    = $script:UserAgent
-        }
-        $code = 0; $body = ''
+        $client = New-Object System.Net.Http.HttpClient
+        $client.Timeout = [TimeSpan]::FromSeconds(10)
+        $req = New-Object System.Net.Http.HttpRequestMessage 'GET', $script:Endpoint
+        $req.Headers.Authorization = New-Object System.Net.Http.Headers.AuthenticationHeaderValue 'Bearer', $token
+        $null = $req.Headers.UserAgent.TryParseAdd($script:UserAgent)
+
         try {
-            $resp = Invoke-WebRequest -Uri $script:Endpoint -Headers $headers -TimeoutSec 10 -UseBasicParsing -ErrorAction Stop
-            $code = [int]$resp.StatusCode
-            $body = $resp.Content
+            $resp = $client.SendAsync($req).GetAwaiter().GetResult()
         } catch {
-            $exc = $_.Exception
-            if ($exc.Response) {
-                try { $code = [int]$exc.Response.StatusCode } catch { $code = 0 }
-                try {
-                    $stream = $exc.Response.GetResponseStream()
-                    $reader = New-Object System.IO.StreamReader($stream)
-                    $body = $reader.ReadToEnd()
-                } catch { $body = '' }
-            }
-            if ($code -eq 0) {
-                return @{ ok = $false; title = 'Network error'; detail = $exc.Message }
+            return @{ ok = $false; title = 'Network error'; detail = $_.Exception.Message }
+        }
+
+        $code = [int]$resp.StatusCode
+        $body = ''
+        try { $body = $resp.Content.ReadAsStringAsync().GetAwaiter().GetResult() } catch { $body = '' }
+
+        # Collect every response header (and content header) for visibility.
+        $headerDump = [ordered]@{}
+        foreach ($pair in $resp.Headers) {
+            $headerDump[$pair.Key] = ($pair.Value -join ', ')
+        }
+        if ($resp.Content -and $resp.Content.Headers) {
+            foreach ($pair in $resp.Content.Headers) {
+                $headerDump["content.$($pair.Key)"] = ($pair.Value -join ', ')
             }
         }
 
         if ($code -eq 429) {
-            # Honor Retry-After if the server sent one (RFC 7231: seconds OR HTTP-date).
+            # The strongly-typed Headers.RetryAfter exposes whichever form the
+            # server used (Delta = relative seconds, Date = absolute HTTP-date).
             $serverWait = 0
+            $serverWaitSource = 'none'
+            $rawRetryAfter = $headerDump['Retry-After']
             try {
-                $raw = $null
-                if ($resp -and $resp.Headers -and $resp.Headers['Retry-After']) {
-                    $raw = $resp.Headers['Retry-After']
-                } elseif ($exc -and $exc.Response -and $exc.Response.Headers) {
-                    $raw = $exc.Response.Headers['Retry-After']
-                }
-                if ($raw) {
-                    $secInt = 0
-                    if ([int]::TryParse([string]$raw, [ref]$secInt)) {
-                        $serverWait = $secInt
-                    } else {
-                        try {
-                            $until = [DateTimeOffset]::Parse([string]$raw)
-                            $serverWait = [int]($until - [DateTimeOffset]::UtcNow).TotalSeconds
-                        } catch {}
+                $ra = $resp.Headers.RetryAfter
+                if ($ra) {
+                    if ($ra.Delta.HasValue) {
+                        $serverWait = [int]$ra.Delta.Value.TotalSeconds
+                        $serverWaitSource = 'Delta'
+                    } elseif ($ra.Date.HasValue) {
+                        $serverWait = [int]($ra.Date.Value - [DateTimeOffset]::UtcNow).TotalSeconds
+                        if ($serverWait -lt 0) { $serverWait = 0 }
+                        $serverWaitSource = 'Date'
                     }
                 }
             } catch {}
 
-            # Exponential backoff on consecutive 429s.
             $script:Consecutive429s = $script:Consecutive429s + 1
-            $backoffSec = [int]([Math]::Min(1800, [Math]::Pow(2, [Math]::Min($script:Consecutive429s, 8)) * 60))
-            $waitSec = [Math]::Max($serverWait, $backoffSec)
-            if ($waitSec -lt 60) { $waitSec = 60 }
+
+            # STRICTLY honor the server. If Retry-After is present, use exactly
+            # that. Only fall back to our own backoff when the server gives us
+            # nothing to go on.
+            if ($serverWait -gt 0) {
+                $waitSec    = $serverWait
+                $waitSource = "server Retry-After"
+            } else {
+                $waitSec    = [int]([Math]::Min(1800, [Math]::Pow(2, [Math]::Min($script:Consecutive429s, 8)) * 60))
+                $waitSource = "local default (no Retry-After)"
+            }
 
             $script:CooldownUntil = [DateTime]::UtcNow.AddSeconds($waitSec)
             $script:CooldownSecs  = $waitSec
+            Save-RateState
 
-            $minutes = [int][Math]::Ceiling($waitSec / 60.0)
-            $reason = "Rate limited (429)"
-            $note = "Cooling down ${minutes} min"
-            if ($serverWait -gt 0) { $note += " (server asked for ${serverWait} s)" }
-            if ($script:Consecutive429s -gt 1) { $note += "; consecutive 429 #$($script:Consecutive429s)" }
-            return @{ ok = $false; status = 429; title = $reason; detail = $note }
+            # Dump full 429 to disk for debugging and so the user can verify
+            # we're honoring what the server actually sent.
+            try {
+                $dump = [PSCustomObject]@{
+                    timestampUtc      = [DateTime]::UtcNow.ToString('o')
+                    status            = $code
+                    rawRetryAfter     = $rawRetryAfter
+                    serverWaitSeconds = $serverWait
+                    serverWaitSource  = $serverWaitSource
+                    waitSecondsUsed   = $waitSec
+                    waitSource        = $waitSource
+                    consecutive429s   = $script:Consecutive429s
+                    cooldownUntilUtc  = $script:CooldownUntil.ToString('o')
+                    headers           = $headerDump
+                    body              = $body
+                }
+                $dump | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $script:AppDir 'last-429.json') -Encoding UTF8
+            } catch {}
+
+            $note = "${waitSec}s ($waitSource)"
+            if ($script:Consecutive429s -gt 1) { $note += "; #$($script:Consecutive429s) in a row" }
+            return @{ ok = $false; status = 429; title = 'Rate limited (429)'; detail = $note }
         }
+
         if ($code -eq 401 -or $code -eq 403) {
             return @{ ok = $false; status = $code; title = "Auth expired ($code)"; detail = 'Run `claude` in a terminal to refresh your token.' }
         }
         if ($code -lt 200 -or $code -ge 300) {
-            $snippet = if ($body) { $body.Substring(0, [Math]::Min(80, $body.Length)) } else { '' }
+            $snippet = if ($body) { $body.Substring(0, [Math]::Min(120, $body.Length)) } else { '' }
             return @{ ok = $false; status = $code; title = "HTTP $code"; detail = $snippet }
         }
         if (-not $body -or -not $body.Trim()) {
@@ -262,18 +345,17 @@ function Invoke-UsageFetch {
             elseif ($data.message)                    { $msg = $data.message }
             elseif ($data.type)                       { $msg = $data.type }
             $msgStr = "$msg"
-            return @{ ok = $false; title = 'API error'; detail = $msgStr.Substring(0, [Math]::Min(100, $msgStr.Length)) }
+            return @{ ok = $false; title = 'API error'; detail = $msgStr.Substring(0, [Math]::Min(120, $msgStr.Length)) }
         }
         $script:LastData         = $data
         $script:LastError        = $null
         $script:LastFetchAt      = [DateTime]::UtcNow
-        $script:Consecutive429s  = 0  # reset backoff counter on success
-        $script:CooldownUntil    = $null
-        $script:CooldownSecs     = 0
+        Clear-RateState          # reset backoff counter and on-disk state
         return @{ ok = $true; data = $data }
     }
     finally {
         $script:InFlight = $false
+        if ($client) { $client.Dispose() }
     }
 }
 
@@ -309,6 +391,24 @@ function Get-LabelPercent {
     }
 }
 
+function Format-CooldownRemaining {
+    if (-not $script:CooldownUntil) { return $null }
+    $rem = $script:CooldownUntil - [DateTime]::UtcNow
+    if ($rem.TotalSeconds -le 0) { return $null }
+    $until = $script:CooldownUntil.ToLocalTime().ToString('h:mm tt')
+    if ($rem.TotalSeconds -lt 60) {
+        return ("Cooling {0}s, until {1}" -f [int]$rem.TotalSeconds, $until)
+    }
+    if ($rem.TotalSeconds -lt 3600) {
+        $m = [int][Math]::Floor($rem.TotalMinutes)
+        $s = [int]($rem.TotalSeconds - $m * 60)
+        return ("Cooling {0}m {1}s, until {2}" -f $m, $s, $until)
+    }
+    $h = [int][Math]::Floor($rem.TotalHours)
+    $m = [int]($rem.TotalMinutes - $h * 60)
+    return ("Cooling {0}h {1}m, until {2}" -f $h, $m, $until)
+}
+
 function Build-Tooltip($errorTitle, $errorDetail) {
     $data = $script:LastData
     $lines = New-Object System.Collections.Generic.List[string]
@@ -339,7 +439,13 @@ function Build-Tooltip($errorTitle, $errorDetail) {
     if ($errorTitle) {
         $lines.Add('')
         $lines.Add("(!) $errorTitle")
+        $cd = Format-CooldownRemaining
+        if ($cd) { $lines.Add($cd) }
         if ($errorDetail) { $lines.Add($errorDetail) }
+        if ($script:Consecutive429s -gt 0) { $lines.Add("Consecutive 429s: $($script:Consecutive429s)") }
+    } else {
+        $cd = Format-CooldownRemaining
+        if ($cd) { $lines.Add($cd) }
     }
     return ($lines.ToArray() -join "`n")
 }
@@ -628,6 +734,10 @@ $notifyIcon.Add_MouseDoubleClick({
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 30 * 1000
 $timer.Add_Tick({
+    # Always refresh the tooltip so the cooldown countdown ticks down live
+    # even when no fetch happens.
+    Update-Tray $notifyIcon
+
     $cooldownClear = (-not $script:CooldownUntil) -or ([DateTime]::UtcNow -ge $script:CooldownUntil)
     if ($script:LastError -and $cooldownClear) {
         if ((-not $script:LastRetryAt) -or ([DateTime]::UtcNow - $script:LastRetryAt).TotalSeconds -ge 60) {
