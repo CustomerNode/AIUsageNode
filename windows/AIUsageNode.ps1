@@ -785,10 +785,14 @@ $notifyIcon.Add_MouseClick({
 $notifyIcon.Add_MouseDoubleClick({
     param($sender, $e)
     if ($e.Button -ne [System.Windows.Forms.MouseButtons]::Left) { return }
+    # If we've never fetched OR the previous fetch is older than the debounce
+    # window, kick off a fresh fetch. Previously this only refreshed when
+    # LastFetchAt was already set, which meant double-clicking did nothing
+    # before the very first successful fetch.
     $debounce = [int]$script:Settings['click-debounce-seconds']
-    if ($script:LastFetchAt -and ([DateTime]::UtcNow - $script:LastFetchAt).TotalSeconds -ge $debounce) {
+    $stale = (-not $script:LastFetchAt) -or (([DateTime]::UtcNow - $script:LastFetchAt).TotalSeconds -ge $debounce)
+    if ($stale) {
         Invoke-Refresh $notifyIcon
-        # Popup may already be open from MouseClick — refresh its contents
         if ($script:PopupForm -and -not $script:PopupForm.IsDisposed) {
             $script:PopupForm.Close()
             Show-UsagePopup
@@ -804,17 +808,26 @@ $notifyIcon.Add_MouseDoubleClick({
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 30 * 1000
 $timer.Add_Tick({
-    # Refresh the tooltip so the cooldown countdown ticks down live, even
-    # though no fetch ever happens from this timer.
+    # When the cooldown deadline passes, clear the stale error state so the
+    # tray doesn't look stuck-red after the rate limit lifts. The user still
+    # has to manually click to actually fetch -- this just resets the UI
+    # so it's obvious the cooldown is over.
+    if ($script:LastError -and $script:CooldownUntil -and [DateTime]::UtcNow -ge $script:CooldownUntil) {
+        $script:LastError     = $null
+        $script:CooldownUntil = $null
+        $script:CooldownSecs  = 0
+        try { Remove-Item $script:RateStatePath -Force -ErrorAction SilentlyContinue } catch {}
+    }
+
+    # Refresh tooltip so the cooldown countdown ticks live, even though no
+    # fetch ever happens from this timer.
     Update-Tray $notifyIcon
 
     # Auto-retry on error is intentionally NOT done here. Background retries
     # were the root cause of an extended rate-limit incident: each retry
-    # against /api/oauth/usage got a fresh 47-min Retry-After, and a buggy
-    # parse fell back to a shorter local cooldown, so the script kept
-    # hammering and the rate-limit window kept resetting. The tray is now
-    # manual-only -- only an explicit click or a context-menu "Refresh now"
-    # makes an HTTP call.
+    # against /api/oauth/usage got a fresh Retry-After window that reset the
+    # rate-limit clock. The tray is manual-only -- only an explicit click
+    # or a context-menu "Refresh now" makes an HTTP call.
     if (-not $script:Settings['auto-refresh']) { return }
     $every = [int]$script:Settings['refresh-seconds']
     if ($every -lt 60) { $every = 60 }
