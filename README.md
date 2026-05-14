@@ -1,12 +1,22 @@
 # AI Usage Node
 
-A Cinnamon panel applet that surfaces your **Claude Code subscription usage** where you actually look — the toolbar.
+Surface your **Claude Code subscription usage** where you actually look — your toolbar / system tray.
 
 It reads the OAuth token that `claude` already stores in `~/.claude/.credentials.json` and polls `/api/oauth/usage` (the same endpoint the `/usage` slash command uses), so the numbers are exactly what you'd see inside a Claude session — **percentages, not dollars**. No API key, no extra spend.
 
 ![Linux Mint](https://img.shields.io/badge/Linux%20Mint-22%2B-87CF3E?logo=linuxmint)
 ![Cinnamon](https://img.shields.io/badge/Cinnamon-6.x-04B060)
+![Windows 11](https://img.shields.io/badge/Windows-10%2F11-0078D6?logo=windows)
 ![License](https://img.shields.io/badge/License-MIT-blue)
+
+## Platforms
+
+| Platform | Host | Location |
+|---|---|---|
+| **Linux Mint 22.x / Cinnamon 6.x** | Cinnamon panel applet (JavaScript) | [`aiusagenode@CustomerNode/`](aiusagenode@CustomerNode/) |
+| **Windows 10 / 11** | System-tray app (PowerShell + WinForms) | [`windows/`](windows/) |
+
+Both clients hit the same Anthropic endpoint, parse the same JSON shape, and render the same metrics. Pick the section below for your platform.
 
 ## Features
 
@@ -14,23 +24,26 @@ It reads the OAuth token that `claude` already stores in `~/.claude/.credentials
 - **Rate-limit-friendly by default** — fetches once at startup, then only when you click the icon (with a small debounce so rapid clicks don't pile up). Auto-refresh on a timer is opt-in, hidden behind a toggle, defaults to 10-minute intervals when enabled.
 - **Per-window breakdown** — 5-hour, 7-day all-models, 7-day Opus, 7-day Sonnet, plus Extra Usage credits when enabled.
 - **Reset times shown both ways** — absolute clock-time with smart formatting (*"today at 6:10 PM"* / *"tomorrow at…"* / *"Mon May 12 at 2:00 AM"*) **and** a live countdown (*"in 4h 50m"*).
-- **Color-coded sparkle icon** — Claude orange → amber → red as you cross configurable warn/alert thresholds. The icon shape stays consistent; only the color changes.
-- **Optional icon-only mode** — hide the panel-label percentage for a minimal look; click the icon for full detail.
+- **Color-coded sparkle icon** — green → amber → red as you cross configurable warn/alert thresholds. The icon shape stays consistent; only the color changes.
 - **Friendly error states** — detects HTTP 429 (rate limited) and 401/403 (token expired) and surfaces what you need to do.
 - **One-click "Open Claude in terminal"** action.
 - **Configurable** — refresh mode, label format (5h/7d, 5h-only, 7d-only, max-of-all), thresholds, terminal command.
 - **No API key required** — reuses your existing Claude Code OAuth login.
-- **Zero dependencies** beyond `curl` (already on every Linux Mint install).
+- **Zero extra dependencies** — `curl` on Linux (always present on Mint); on Windows, just whatever PowerShell ships in-box.
 
-## Install
+---
 
-### One-liner
+## Linux Mint / Cinnamon
+
+### Install
+
+One-liner:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/CustomerNode/AIUsageNode/main/install.sh | bash
 ```
 
-### From a clone
+From a clone:
 
 ```bash
 git clone https://github.com/CustomerNode/AIUsageNode.git
@@ -40,7 +53,7 @@ cd AIUsageNode
 
 After install, **right-click your panel → Applets → AI Usage Node → Add to panel**, or run the `install.sh` script with the `--add` flag to drop it into the right side of your bottom panel automatically.
 
-## Configure
+### Configure
 
 Right-click the sparkle in your panel → **Configure…**
 
@@ -55,11 +68,122 @@ Right-click the sparkle in your panel → **Configure…**
 | Alert threshold | 90 % | Icon turns red at this level. |
 | Terminal command | `gnome-terminal -- bash -lc 'claude'` | Run by *Open Claude in terminal*. |
 
-The popup itself shows a status line like `Updated just now · 2:48 PM · click to refresh` (or `auto every 10 min` when timer mode is on) so it's always obvious how stale the data is.
+### Uninstall
 
-## How it works
+```bash
+./uninstall.sh
+```
 
-`claude` stores an OAuth access token in `~/.claude/.credentials.json` after you log in with your subscription. This applet reads that token and calls:
+Or manually:
+
+```bash
+rm -rf ~/.local/share/cinnamon/applets/aiusagenode@CustomerNode
+```
+
+…then remove it from the panel via right-click → *Remove from panel*.
+
+### Compatibility
+
+- **Linux Mint 22.x** with **Cinnamon 6.x** — tested on Mint 22.3 / Cinnamon 6.6.7.
+- Should work on any Cinnamon ≥ 5.x; if you find a regression on an older version please open an issue.
+
+---
+
+## Windows 10 / 11
+
+A small PowerShell-hosted system-tray app — same colored sparkle, same metrics, same OAuth-token-only design. No `.exe` to compile, no extra dependencies beyond what Windows ships in-box.
+
+### Install
+
+From a clone (recommended):
+
+```powershell
+git clone https://github.com/CustomerNode/AIUsageNode.git
+cd AIUsageNode\windows
+.\install.ps1 -Start
+```
+
+`install.ps1` does three things:
+
+1. Copies `AIUsageNode.ps1`, `start-aiusagenode.vbs`, and `uninstall.ps1` to `%LOCALAPPDATA%\AIUsageNode\`.
+2. Registers `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\AIUsageNode` so the tray app autostarts at every login (skip with `-NoAutostart`).
+3. With `-Start`, launches the tray app immediately via the silent VBS launcher.
+
+If PowerShell blocks the script with an execution-policy error, allow it for your user once:
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
+```
+
+### Pin to the visible taskbar (Windows 11)
+
+By default Windows 11 hides new tray icons under the `^` overflow chevron. You have two options:
+
+- **GUI**: open the overflow tray, drag the colored sparkle onto the visible taskbar.
+- **Programmatic**: the install script doesn't flip this for you (Microsoft considers it user choice), but you can do it after the icon shows up once. The relevant registry value is `HKCU\Control Panel\NotifyIconSettings\<UID>\IsPromoted` — set it to `1`, then restart the tray app. PowerShell:
+
+  ```powershell
+  $key = Get-ChildItem 'HKCU:\Control Panel\NotifyIconSettings' |
+      Where-Object { (Get-ItemProperty $_.PSPath).InitialTooltip -like 'AI Usage Node*' } |
+      Select-Object -First 1
+  Set-ItemProperty -Path $key.PSPath -Name 'IsPromoted' -Value 1 -Type DWord
+  # then restart the tray:
+  Get-Process pwsh | Where-Object { $_.CommandLine -like '*AIUsageNode*' } | Stop-Process -Force
+  Start-Process wscript.exe "`"$env:LOCALAPPDATA\AIUsageNode\start-aiusagenode.vbs`""
+  ```
+
+### Interact with the tray icon
+
+| Gesture | Action |
+|---|---|
+| Hover | Tooltip shows the headline percentages |
+| Single left-click | Popup window with bars + reset times (toggle — clicking again closes it; clicking outside closes it; Esc closes it) |
+| Double left-click | Force a refresh (respecting the debounce setting) |
+| Right-click | Context menu: Refresh now / Open Claude in terminal / Edit settings / Reload settings / Exit |
+
+### Configure
+
+Right-click the sparkle → **Edit settings** to open `%LOCALAPPDATA%\AIUsageNode\settings.json` in Notepad. Edit, save, then right-click → **Reload settings** (no restart needed).
+
+| Key | Default | What it does |
+|---|---|---|
+| `auto-refresh` | `false` | When `true`, polls on a timer in addition to manual refreshes. |
+| `refresh-seconds` | `600` | Auto-refresh interval. Min 60. |
+| `click-debounce-seconds` | `5` | On double-click, skip refetch if data is fresher than this. |
+| `show-panel-label` | `true` | (Reserved — Windows tray icons can't show inline text labels; left in for parity.) |
+| `label-format` | `5h_and_7d` | `5h_and_7d` / `5h_only` / `7d_only` / `max`. |
+| `warn-threshold` | `75` | Icon turns amber at this level. |
+| `alert-threshold` | `90` | Icon turns red at this level. |
+| `terminal-command` | `wt.exe pwsh -NoExit -Command claude` | Run by *Open Claude in terminal*. Change to `cmd.exe /K claude` or your preferred shell. |
+
+### Uninstall
+
+From the cloned repo:
+
+```powershell
+cd AIUsageNode\windows
+.\uninstall.ps1
+```
+
+Or from the installed copy:
+
+```powershell
+& "$env:LOCALAPPDATA\AIUsageNode\uninstall.ps1"
+```
+
+The uninstaller stops the running tray, removes the autostart entry, and deletes `%LOCALAPPDATA%\AIUsageNode\`.
+
+### Compatibility
+
+- **Windows 11** (any build) and **Windows 10 1809+** — anywhere the modern `NotifyIcon` and `HKCU\...\NotifyIconSettings` exist.
+- Works with the in-box **Windows PowerShell 5.1**; if **PowerShell 7+** (`pwsh.exe`) is installed, the launcher uses it automatically.
+- Requires `claude` (Claude Code CLI) to be installed and logged in. <https://docs.claude.com/claude-code>
+
+---
+
+## How it works (both platforms)
+
+`claude` stores an OAuth access token in `~/.claude/.credentials.json` (Linux/macOS) or `%USERPROFILE%\.claude\.credentials.json` (Windows) after you log in with your subscription. This applet reads that token and calls:
 
 ```
 GET https://api.anthropic.com/api/oauth/usage
@@ -78,27 +202,7 @@ The response looks like:
 }
 ```
 
-That's it. The applet caches nothing, stores nothing, and never sends anything anywhere except that one Anthropic request. If the token expires, run `claude` once in a terminal to refresh it; the applet recovers on its next poll.
-
-## Uninstall
-
-```bash
-./uninstall.sh
-```
-
-Or manually:
-
-```bash
-rm -rf ~/.local/share/cinnamon/applets/aiusagenode@CustomerNode
-```
-
-…then remove it from the panel via right-click → *Remove from panel*.
-
-## Compatibility
-
-- **Linux Mint 22.x** with **Cinnamon 6.x** — tested on Mint 22.3 / Cinnamon 6.6.7.
-- Should work on any Cinnamon ≥ 5.x; if you find a regression on an older version please open an issue.
-- Requires `claude` (Claude Code CLI) to be installed and logged in. <https://docs.claude.com/claude-code>
+That's it. The clients cache nothing, store nothing, and never send anything anywhere except that one Anthropic request. If the token expires, run `claude` once in a terminal to refresh it; the icon recovers on its next poll.
 
 ## License
 
@@ -106,4 +210,4 @@ MIT — see [LICENSE](LICENSE).
 
 ## Disclaimer
 
-Not affiliated with Anthropic. "Claude" and "Claude Code" are trademarks of Anthropic, PBC. This applet uses the public OAuth endpoint your own Claude Code CLI already calls; it does not bypass, scrape, or modify anything.
+Not affiliated with Anthropic. "Claude" and "Claude Code" are trademarks of Anthropic, PBC. These clients use the public OAuth endpoint your own Claude Code CLI already calls; they do not bypass, scrape, or modify anything.
